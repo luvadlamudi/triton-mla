@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triton-mla"
+version = "0.1.0"
+description = "Fused Triton decode kernel for DeepSeek Multi-head Latent Attention (MLA)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["torch>=2.4", "triton>=3.0"]
+keywords = ["triton", "attention", "mla", "deepseek", "cuda", "kernel", "llm-inference"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+triton-mla-bench = "triton_mla.bench:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
