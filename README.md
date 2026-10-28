@@ -7,7 +7,7 @@ benchmark against `torch.compile`.
 
 ```bash
 pip install triton-mla                                    # once published to PyPI
-pip install git+https://github.com/<you>/triton-mla.git   # straight from GitHub
+pip install git+https://github.com/lvadlamudi/triton-mla.git   # straight from GitHub
 ```
 
 ## Usage
