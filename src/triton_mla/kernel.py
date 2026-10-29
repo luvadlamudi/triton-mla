@@ -32,27 +32,17 @@ _LN2 = tl.constexpr(0.6931471805599453)
 def _stage1_configs():
     if _INTERPRET:
         return [triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1)]
-    configs = []
-    for block_h in (16, 32, 64):
-        for block_n in (16, 32, 64):
-            for num_warps in (4, 8):
-                for num_stages in (1, 2, 3):
-                    # [BLOCK_H, 512] fp32 accumulator must fit in registers.
-                    if block_h * 512 // (num_warps * 32) > 256:
-                        continue
-                    configs.append(
-                        triton.Config(
-                            {"BLOCK_H": block_h, "BLOCK_N": block_n},
-                            num_warps=num_warps,
-                            num_stages=num_stages,
-                        )
-                    )
-    return configs
+    # Every config that won at least one shape in scripts/tune_splits.py on H100.
+    # BLOCK_H=64 lets Hopper use wgmma and halves KV re-reads across head groups.
+    return [
+        triton.Config({"BLOCK_H": bh, "BLOCK_N": 64}, num_warps=nw, num_stages=ns)
+        for bh, nw, ns in [(64, 8, 3), (64, 8, 2), (32, 4, 3), (32, 8, 3), (16, 4, 3), (16, 8, 3)]
+    ]
 
 
 @triton.autotune(
     configs=_stage1_configs(),
-    key=["num_heads", "NUM_SPLITS", "PAGED", "PAGE_SIZE", "D_LATENT", "D_ROPE"],
+    key=["num_heads", "num_splits", "batch_bucket", "seq_bucket", "PAGED", "PAGE_SIZE", "D_LATENT", "D_ROPE"],
 )
 @triton.jit
 def _mla_decode_stage1(
@@ -74,20 +64,24 @@ def _mla_decode_stage1(
     stride_ml_b,
     stride_ml_h,
     num_heads,
+    num_splits,
+    batch_bucket,  # autotune key only
+    seq_bucket,  # autotune key only
     PAGED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     D_LATENT: tl.constexpr,
     D_ROPE: tl.constexpr,
-    NUM_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_s = tl.program_id(2)
+    # Head groups that read the same KV slice are adjacent in launch order so
+    # all but the first hit L2 instead of HBM.
+    pid_h = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_b = tl.program_id(2)
 
     seq_len = tl.load(SeqLens + pid_b)
-    split_len = tl.cdiv(seq_len, NUM_SPLITS)
+    split_len = tl.cdiv(seq_len, num_splits)
     start = pid_s * split_len
     end = tl.minimum(start + split_len, seq_len)
 
@@ -193,13 +187,18 @@ def _num_sms(device):
     return 132
 
 
-def get_num_splits(batch, num_heads, max_seqlen, num_sms, min_tokens_per_split=256):
-    """Pick enough KV splits to fill the GPU without making splits too short."""
+def get_num_splits(batch, num_heads, max_seqlen, num_sms, min_tokens_per_split=128):
+    """Pick the split count that fills about one wave of SMs.
+
+    The best stage-1 config holds 64 heads per program and runs one program per
+    SM, so the target is batch * head_groups * splits ~= num_sms. Extra splits
+    only add fp32 partial-output traffic (measured in scripts/tune_splits.py).
+    """
     head_groups = triton.cdiv(num_heads, 64)
-    target = triton.cdiv(2 * num_sms, max(batch * head_groups, 1))
-    max_by_len = max(triton.cdiv(max_seqlen, min_tokens_per_split), 1)
+    target = num_sms // max(batch * head_groups, 1)
+    max_by_len = triton.cdiv(max_seqlen, min_tokens_per_split)
     splits = max(min(target, max_by_len, 64), 1)
-    return triton.next_power_of_2(splits)
+    return 1 << (splits.bit_length() - 1)
 
 
 def mla_decode(
@@ -254,11 +253,13 @@ def mla_decode(
         block_table = block_table.to(torch.int32)
         page_size = kv_cache.shape[1]
         stride_bt_b = block_table.stride(0)
+        capacity = block_table.shape[1] * page_size
     else:
         assert kv_cache.shape[0] == batch
         block_table = cache_seqlens
         page_size = 1
         stride_bt_b = 0
+        capacity = kv_cache.shape[1]
 
     if num_splits is None:
         max_seqlen = int(cache_seqlens.max().item()) if batch > 0 else 0
@@ -270,7 +271,7 @@ def mla_decode(
     lse = torch.empty(batch, num_heads, dtype=torch.float32, device=q.device)
 
     def grid(meta):
-        return (batch, triton.cdiv(num_heads, meta["BLOCK_H"]), num_splits)
+        return (triton.cdiv(num_heads, meta["BLOCK_H"]), num_splits, batch)
 
     _mla_decode_stage1[grid](
         q,
@@ -291,11 +292,13 @@ def mla_decode(
         mid_lse.stride(0),
         mid_lse.stride(1),
         num_heads,
+        num_splits,
+        triton.next_power_of_2(batch),
+        triton.next_power_of_2(capacity),
         PAGED=paged,
         PAGE_SIZE=page_size,
         D_LATENT=head_dim_v,
         D_ROPE=d_rope,
-        NUM_SPLITS=num_splits,
     )
     _mla_decode_stage2[(batch, num_heads)](
         mid_o,

@@ -4,14 +4,17 @@
 """
 
 import argparse
+import csv
+import os
 
 import torch
 import triton
 
-from .kernel import _num_sms, get_num_splits, mla_decode
+from .kernel import _mla_decode_stage1, _num_sms, get_num_splits, mla_decode
 from .reference import mla_decode_torch
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+CSV_FIELDS = ["gpu", "batch", "seqlen", "heads", "num_splits", "config", "bytes", "triton_us", "eager_us", "compile_us"]
 
 
 def make_inputs(batch, seqlen, num_heads, page_size, dtype, device, d_latent=512, d_rope=64):
@@ -33,6 +36,7 @@ def main():
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
     parser.add_argument("--no-eager", action="store_true")
+    parser.add_argument("--csv", help="also append results to this CSV file")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -41,10 +45,18 @@ def main():
     scale = 192 ** -0.5
     compiled = torch.compile(mla_decode_torch, mode=args.compile_mode, dynamic=False)
 
-    print(f"# {torch.cuda.get_device_name()}  heads={args.heads}  page={args.page_size}  {args.dtype}")
-    cols = ["batch", "seqlen", "splits", "triton us", "TB/s", "compile us", "speedup"]
+    gpu = torch.cuda.get_device_name()
+    writer = None
+    if args.csv:
+        os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
+        csv_file = open(args.csv, "w", newline="")
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+
+    print(f"# {gpu}  heads={args.heads}  page={args.page_size}  {args.dtype}")
+    cols = ["batch", "seqlen", "splits", "config", "triton us", "TB/s", "TFLOPS", "compile us", "speedup"]
     if not args.no_eager:
-        cols.insert(5, "eager us")
+        cols.insert(7, "eager us")
     print("| " + " | ".join(cols) + " |")
     print("|" + "---|" * len(cols))
 
@@ -60,11 +72,15 @@ def main():
                 return compiled(q, kv, seqlens, bt, softmax_scale=scale)
 
             torch.testing.assert_close(run_triton().float(), run_compiled().float(), atol=2e-2, rtol=2e-2)
+            cfg = _mla_decode_stage1.best_config
+            config = f"H{cfg.kwargs['BLOCK_H']}/N{cfg.kwargs['BLOCK_N']}/w{cfg.num_warps}/s{cfg.num_stages}"
 
             t_triton = triton.testing.do_bench(run_triton) * 1e3
             t_compile = triton.testing.do_bench(run_compiled) * 1e3
             nbytes = (batch * seqlen * kv.shape[-1] + q.numel() + batch * args.heads * 512) * elt
-            row = [batch, seqlen, splits, f"{t_triton:.1f}", f"{nbytes / t_triton / 1e6:.2f}"]
+            flops = batch * seqlen * args.heads * 2 * (kv.shape[-1] + 512)
+            row = [batch, seqlen, splits, config, f"{t_triton:.1f}", f"{nbytes / t_triton / 1e6:.2f}", f"{flops / t_triton / 1e6:.0f}"]
+            t_eager = None
             if not args.no_eager:
                 t_eager = triton.testing.do_bench(
                     lambda: mla_decode_torch(q, kv, seqlens, bt, softmax_scale=scale)
@@ -72,6 +88,22 @@ def main():
                 row.append(f"{t_eager:.1f}")
             row += [f"{t_compile:.1f}", f"{t_compile / t_triton:.2f}x"]
             print("| " + " | ".join(str(c) for c in row) + " |", flush=True)
+            if writer:
+                writer.writerow(
+                    {
+                        "gpu": gpu,
+                        "batch": batch,
+                        "seqlen": seqlen,
+                        "heads": args.heads,
+                        "num_splits": splits,
+                        "config": config,
+                        "bytes": nbytes,
+                        "triton_us": t_triton,
+                        "eager_us": t_eager,
+                        "compile_us": t_compile,
+                    }
+                )
+                csv_file.flush()
             del q, kv, seqlens, bt
             torch.cuda.empty_cache()
 

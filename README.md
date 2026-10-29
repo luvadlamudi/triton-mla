@@ -60,24 +60,56 @@ The kernel (`src/triton_mla/kernel.py`) is flash-decoding style:
    in `exp2` space with fp32 accumulators.
 2. **Stage 2** - log-sum-exp merge of the per-split partial outputs.
 
-The split count is chosen so `batch x head_groups x splits` fills the SMs
-without making splits shorter than ~256 tokens, which keeps small-batch,
-long-context decode bandwidth bound instead of occupancy bound. Tile sizes,
-warps and pipeline stages are autotuned per GPU.
+Head groups that share a KV slice are adjacent in launch order, so only the
+first one reads it from HBM and the rest hit L2. The split count targets one
+wave of SMs (`batch x head_groups x splits ~= num_SMs`); more splits only add
+fp32 partial-output traffic. Both choices, and the autotune search space, come
+from a measured sweep of every tile config x split count
+(`scripts/tune_splits.py`). The autotune key includes batch and context-size
+buckets so a config tuned on a tiny problem is not reused for a large one.
 
 The torch baseline (`mla_decode_torch`) gathers the paged cache, materializes the
 `[B, H, S]` score matrix and runs two bmm's; `torch.compile` fuses the
 softmax/masking but still writes the scores and the gathered cache to HBM,
 which is where the fused kernel wins.
 
-## Benchmark
+## Results (H100 80GB SXM)
+
+128 query heads (DeepSeek-V3, one GPU), bf16, paged KV cache with 64-token
+pages, one query token per sequence. `torch.compile` uses
+`mode="max-autotune-no-cudagraphs"`. Timed with `triton.testing.do_bench`;
+every case is checked for numerical agreement before timing.
+
+![Speedup over torch.compile](assets/speedup.png)
+
+| batch | context | Triton | torch.compile | speedup | Triton TFLOPS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4K | 24.4 us | 29.1 us | 1.19x | 47 |
+| 1 | 32K | 67.9 us | 86.9 us | 1.28x | 135 |
+| 8 | 1K | 30.7 us | 29.1 us | 0.95x | 74 |
+| 8 | 32K | 326 us | 538 us | 1.65x | 224 |
+| 32 | 32K | 1.20 ms | 4.32 ms | 3.59x | 242 |
+| 128 | 32K | 4.69 ms | 16.86 ms | 3.60x | 249 |
+
+Full sweep: [`results/bench_h100.csv`](results/bench_h100.csv). Faster than
+`torch.compile` in 15 of 16 shapes; the one loss is batch 8 at 1K tokens, where
+every implementation is launch-latency bound.
+
+**Why TFLOPS, not bandwidth.** With 128 heads sharing one latent vector, every
+cached byte feeds ~240 FLOPs of tensor-core work, which puts MLA decode near the
+H100's compute roof rather than its memory roof. The kernel reaches ~250 TFLOPS,
+about 25% of H100 dense bf16 peak. At batch >= 32 `torch.compile` produced no
+gain over eager PyTorch, so the large-batch speedups are effectively over the
+plain PyTorch bmm-softmax-bmm path.
+
+![Achieved TFLOPS](assets/tflops_h100.png)
+
+Reproduce (locally on a GPU, or on Modal with `modal run modal_app.py --cmd "..."`):
 
 ```bash
-triton-mla-bench --batch 1 32 128 --seqlen 4096 16384
+triton-mla-bench --batch 1 8 32 128 --seqlen 1024 4096 16384 32768 --csv results/bench.csv
+python scripts/plot_bench.py results/bench.csv --out assets
 ```
-
-Prints a markdown table of Triton vs eager vs `torch.compile` latency, achieved
-memory bandwidth and speedup. Results depend on the GPU; run it on yours.
 
 ## Tests
 
@@ -96,6 +128,9 @@ an un-absorbed per-head MHA computation.
 
 - One query token per sequence (no speculative / MTP multi-token decode yet).
 - bf16 / fp16 cache only; no FP8 KV cache.
+- **Blackwell (B200) is not working yet**: the kernel hits a misaligned-address
+  fault on B200 with Triton 3.8 while being correct on H100. Under investigation
+  (`scripts/sweep_configs.py`).
 - `num_splits=None` reads `cache_seqlens.max()` on the host; pass `num_splits`
   for CUDA-graph capture.
 
