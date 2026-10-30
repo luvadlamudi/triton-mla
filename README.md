@@ -1,4 +1,4 @@
-# triton-mla
+# DeepSeek MLA Triton Kernel
 
 A fused decode kernel for DeepSeek's Multi-head Latent Attention, the attention
 used in DeepSeek-V2, V3 and R1. It is written in Triton, OpenAI's Python
